@@ -1,0 +1,677 @@
+openapi: "3.0.3"
+info:
+  title: social_service API
+  version: "1.0.0"
+  description: >
+    Friend requests, friendships, and private conversations (direct / group)
+    for the Community Chat & Voice Platform. This service is the authority on
+    conversation participant lists; messaging_service enforces read/post access
+    from these participants via `conversation_changed` events.
+servers:
+  - url: /
+    description: Public ingress routes platform traffic; no service prefix at runtime.
+
+tags:
+  - name: friend-requests
+  - name: friends
+  - name: conversations
+  - name: probes
+
+security:
+  - bearerAuth: []
+
+paths:
+  /friend-requests:
+    post:
+      operationId: sendFriendRequest
+      summary: Send a friend request to another user
+      tags: [friend-requests]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendFriendRequestRequest'
+      responses:
+        "201":
+          description: Friend request created (status `pending`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendRequest'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "409":
+          description: Conflict — `already_friends` or `request_pending`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "422":
+          description: Semantic validation failure — `self_request`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+    get:
+      operationId: listFriendRequests
+      summary: List pending friend requests (incoming or outgoing)
+      tags: [friend-requests]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: direction
+          in: query
+          schema:
+            type: string
+            enum: [incoming, outgoing]
+            default: incoming
+          description: Which side of the request the caller is on.
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        "200":
+          description: Pending requests, newest first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendRequestPage'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /friend-requests/{request_id}/accept:
+    post:
+      operationId: acceptFriendRequest
+      summary: Accept a pending incoming friend request
+      description: Idempotent — accepting an already-accepted request returns the existing friendship.
+      tags: [friend-requests]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        "200":
+          description: Friendship (possibly pre-existing, for repeat accepts)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Friendship'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          description: Conflict — `request_not_pending`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /friend-requests/{request_id}/decline:
+    post:
+      operationId: declineFriendRequest
+      summary: Decline a pending incoming friend request
+      tags: [friend-requests]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        "204":
+          description: Request declined
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          description: Conflict — `request_not_pending`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /friend-requests/{request_id}:
+    delete:
+      operationId: cancelFriendRequest
+      summary: Cancel an outgoing pending friend request (sender only)
+      tags: [friend-requests]
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        "204":
+          description: Request cancelled
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          description: Conflict — `request_not_pending`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /friends:
+    get:
+      operationId: listFriends
+      summary: List the caller's friends
+      description: Returns an empty list for new users; clients use this empty state to suggest people from shared community member lists.
+      tags: [friends]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        "200":
+          description: Friends ordered by friendship creation, newest first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendList'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /friends/{user_id}:
+    delete:
+      operationId: removeFriend
+      summary: Remove a friend (mutual, immediate)
+      tags: [friends]
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Friendship removed for both sides
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          description: Not friends — `not_friends`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /conversations/direct:
+    post:
+      operationId: openDirectConversation
+      summary: Open (or reuse) a 1:1 direct conversation with a friend
+      description: >
+        Idempotent per pair — when a direct conversation already exists between
+        the caller and `friend_user_id`, the existing conversation is returned
+        with `200` and no new event is published.
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenDirectConversationRequest'
+      responses:
+        "201":
+          description: Direct conversation created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        "200":
+          description: Existing direct conversation returned (pair already has one)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "422":
+          description: Semantic validation failure — `not_friends` or `self_request`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /conversations/group:
+    post:
+      operationId: createGroupConversation
+      summary: Create a group conversation with the caller plus up to 9 friends
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateGroupConversationRequest'
+      responses:
+        "201":
+          description: Group conversation created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "422":
+          description: Semantic validation failure — `group_too_large`, `not_friends`, `missing_participants`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /conversations:
+    get:
+      operationId: listConversations
+      summary: List the caller's current conversations (DM sidebar)
+      description: Excludes conversations the caller has left.
+      tags: [conversations]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        "200":
+          description: Conversations ordered by creation, newest first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConversationPage'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /conversations/{conversation_id}/participants:
+    post:
+      operationId: addConversationParticipants
+      summary: Add friends to a group conversation
+      description: Caller must be a current participant; total participants never exceed 10.
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddParticipantsRequest'
+      responses:
+        "200":
+          description: Updated conversation with the new participants
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is not a current participant — `not_a_participant`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "422":
+          description: Semantic validation failure — `group_full`, `not_friends`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /conversations/{conversation_id}/leave:
+    post:
+      operationId: leaveConversation
+      summary: Leave a group conversation
+      description: Direct conversations cannot be left (`group_only_operation`).
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      responses:
+        "204":
+          description: Caller left the conversation
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "422":
+          description: Semantic validation failure — `group_only_operation`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /conversations/{conversation_id}:
+    patch:
+      operationId: renameConversation
+      summary: Rename a group conversation
+      description: Caller must be a current participant; direct conversations cannot be renamed.
+      tags: [conversations]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenameConversationRequest'
+      responses:
+        "200":
+          description: Updated conversation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is not a current participant — `not_a_participant`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "422":
+          description: Semantic validation failure — `invalid_name`, `group_only_operation`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /healthz:
+    get:
+      operationId: getHealthz
+      summary: Liveness probe
+      tags: [probes]
+      security: []
+      responses:
+        "200":
+          description: Process is alive
+        "503":
+          description: Process is shutting down
+
+  /readyz:
+    get:
+      operationId: getReadyz
+      summary: Readiness probe (PostgreSQL and Kafka producer connectivity)
+      tags: [probes]
+      security: []
+      responses:
+        "200":
+          description: Service is ready to receive traffic
+        "503":
+          description: A critical dependency is unreachable or shutdown has started
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Short-lived access token issued by identity_service (JWT, asymmetric
+        signature). Verified locally against identity_service's published
+        public verification keys; claims used: `sub` (user_id), `sid`,
+        `email_verified`, `exp`, `iat`, `iss`, `aud`.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        maxLength: 64
+      description: >
+        Opaque client-generated key for safe retries on creation endpoints.
+        A retried request with the same key returns the original result
+        instead of creating a duplicate.
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+      description: Opaque pagination cursor from a previous page.
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    RequestId:
+      name: request_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ConversationId:
+      name: conversation_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable error code, snake_case.
+          example: request_pending
+        detail:
+          type: string
+          description: Human-readable explanation.
+
+    SendFriendRequestRequest:
+      type: object
+      required: [recipient_user_id]
+      properties:
+        recipient_user_id:
+          type: string
+          format: uuid
+          description: The user to befriend, resolved client-side via identity_service's public lookup.
+
+    FriendRequest:
+      type: object
+      required: [request_id, sender_user_id, recipient_user_id, status, created_at]
+      properties:
+        request_id:
+          type: string
+          format: uuid
+        sender_user_id:
+          type: string
+          format: uuid
+        recipient_user_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, accepted, declined, cancelled]
+        created_at:
+          type: string
+          format: date-time
+
+    FriendRequestPage:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/FriendRequest'
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page; null when there are no more.
+
+    Friendship:
+      type: object
+      required: [friend_user_id, since]
+      properties:
+        friend_user_id:
+          type: string
+          format: uuid
+        since:
+          type: string
+          format: date-time
+          description: When the friendship was created.
+
+    FriendList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Friendship'
+        next_cursor:
+          type: string
+          nullable: true
+
+    OpenDirectConversationRequest:
+      type: object
+      required: [friend_user_id]
+      properties:
+        friend_user_id:
+          type: string
+          format: uuid
+
+    CreateGroupConversationRequest:
+      type: object
+      required: [participant_ids]
+      properties:
+        name:
+          type: string
+          nullable: true
+          maxLength: 100
+          description: Optional group name.
+        participant_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 1
+          maxItems: 9
+          uniqueItems: true
+          description: Friends to add besides the creator; the total participant cap of 10 includes the creator.
+
+    ConversationParticipant:
+      type: object
+      required: [user_id, joined_at]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        joined_at:
+          type: string
+          format: date-time
+
+    Conversation:
+      type: object
+      required: [conversation_id, kind, name, created_by, participants, created_at, conversation_version]
+      properties:
+        conversation_id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [direct, group]
+        name:
+          type: string
+          nullable: true
+          maxLength: 100
+          description: Always null for direct conversations.
+        created_by:
+          type: string
+          format: uuid
+        participants:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConversationParticipant'
+        created_at:
+          type: string
+          format: date-time
+        conversation_version:
+          type: integer
+          minimum: 1
+          description: Monotonic version of the conversation state; carried on `conversation_changed` events.
+
+    ConversationPage:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Conversation'
+        next_cursor:
+          type: string
+          nullable: true
+
+    AddParticipantsRequest:
+      type: object
+      required: [user_ids]
+      properties:
+        user_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 1
+          maxItems: 9
+          uniqueItems: true
+          description: Friends of the caller to add; the total participant cap of 10 is enforced after the addition.
+
+    RenameConversationRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
