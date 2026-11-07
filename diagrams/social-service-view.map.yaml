@@ -1,0 +1,141 @@
+schema_version: 2
+diagram_id: social-service-view
+mode: service
+orientation: LR
+scope: social_service service view - private social graph, friend requests, friendships
+  and direct/group conversations; PostgreSQL state plus producer-only publishing on
+  social_events.
+sources:
+- path: docs/architecture.md
+  sha256: 231c6ad70110cfaee434bd1c784e060e968a14af0cf64fe8f3bcdb8872396c21
+- path: docs/decisions/ADR-001-canonical-pairs-and-unique-direct-conversations.md
+  sha256: d68c81202cb28d57a04a23ab82e4eb9c5ae811dd207cc66047a41ef03d33667a
+- path: docs/decisions/ADR-002-outbox-and-no-identity-sync.md
+  sha256: 9366f16a74caf47c4b4935d28b21c2a7f30fc844117dfefb2e3dfb9ac85a7899
+- path: docs/openapi_spec.yaml
+  sha256: 0fd9e1b2b13f2fd91938e7782b4b9d3b78d93206295792419d2e3eaf622671c0
+- path: docs/user_stories.md
+  sha256: 0c8c7ef6e1abd34a173c5ccfc86fff0046b6c788116a361c1d7209dd544380dd
+entities:
+- id: client
+  label: Member client
+  kind: annotation
+  role: inbound
+  row: 372
+  evidence:
+  - path: docs/user_stories.md
+    quote: an authenticated end user (verified access token)
+  - path: docs/architecture.md
+    quote: Every flow below assumes an authenticated caller (local JWT verification;
+      claims `sub` = user id).
+- id: svc
+  name: social_service
+  label: social_service
+  kind: service
+  technology: kubernetes-pod
+  role: service
+  row: 260
+  evidence:
+  - path: docs/architecture.md
+    quote: '`social_service` owns the **private social graph** of the platform'
+  - path: docs/architecture.md
+    quote: Any replica can serve any request.
+- id: db
+  label: social PostgreSQL
+  kind: database
+  technology: postgresql
+  role: outbound
+  row: 313
+  evidence:
+  - path: docs/architecture.md
+    quote: All state is PostgreSQL; all integration is Kafka.
+  - path: docs/architecture.md
+    quote: Schema-owned tables (snake_case; all timestamps `timestamptz`; uuid v4
+      keys; migrations applied at deploy time).
+- id: kafka
+  name: social_events
+  label: social_events broker
+  kind: broker
+  technology: kafka
+  role: outbound
+  row: 10
+  evidence:
+  - path: docs/architecture.md
+    quote: '`social_service` **produces only** on topic `social_events`; it consumes
+      nothing.'
+  - path: docs/architecture.md
+    quote: Transactional outbox.
+relationships:
+- id: r-client
+  source: client
+  target: svc
+  type: request
+  interaction:
+    channel: direct
+    purpose: friend request, friend list and conversation API calls
+    protocol: HTTP
+  evidence:
+  - path: docs/openapi_spec.yaml
+    quote: 'openapi: "3.0.3"'
+  - path: docs/architecture.md
+    quote: is accepted on every HTTP call
+- id: r-db
+  source: svc
+  target: db
+  type: ownership
+  evidence:
+  - path: docs/architecture.md
+    quote: All state is PostgreSQL; all integration is Kafka.
+  - path: docs/architecture.md
+    quote: The pair is canonicalized on write (`a = LEAST`, `b = GREATEST`), which
+      makes duplicate inserts and mutual-removal races impossible at the storage layer.
+- id: r-prod
+  source: svc
+  target: kafka
+  type: event
+  direction: forward
+  interaction:
+    channel: messaging
+    purpose: publish friend_request_changed and conversation_changed
+    protocol: Kafka
+  messaging:
+    role: producer
+    topic: social_events
+  evidence:
+  - path: docs/architecture.md
+    quote: '`social_service` **produces only** on topic `social_events`; it consumes
+      nothing.'
+  - path: docs/architecture.md
+    quote: produces to Kafka
+view:
+  entities:
+  - client
+  - svc
+  - db
+  - kafka
+  groups: []
+  edges:
+  - id: e-client
+    source: client
+    target: svc
+    relationships:
+    - r-client
+    label: HTTP
+    flow: forward
+  - id: e-db
+    source: svc
+    target: db
+    relationships:
+    - r-db
+    label: SQL
+    flow: forward
+  - id: e-prod
+    source: svc
+    target: kafka
+    relationships:
+    - r-prod
+    label: 'Producers
+
+      social_service:social_events'
+    flow: forward
+  omitted: []
