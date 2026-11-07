@@ -1,0 +1,10 @@
+# Built binaries. Keep these anchored to the repository root: an unanchored
+# `server` would also match the entrypoint source directory `cmd/server`.
+/server
+bin/
+*.exe
+*.test
+*.out
+coverage.out
+vendor/
+.env
